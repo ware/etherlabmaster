@@ -145,10 +145,14 @@ int ec_master_init(ec_master_t *master, /**< EtherCAT master */
 
     master->slaves = NULL;
     master->slave_count = 0;
-    
+
     INIT_LIST_HEAD(&master->configs);
 
     master->app_time = 0ULL;
+#ifdef EC_HAVE_CYCLES
+    master->dc_cycles_app_time = 0;
+#endif
+    master->dc_jiffies_app_time = 0;
     master->app_start_time = 0ULL;
     master->has_app_time = 0;
 
@@ -862,7 +866,7 @@ void ec_master_send_datagrams(ec_master_t *master /**< EtherCAT master */)
 {
     ec_datagram_t *datagram, *next;
     size_t datagram_size;
-    uint8_t *frame_data, *cur_data;
+    uint8_t *frame_data, *cur_data, *frame_datagram_data;
     void *follows_word;
 #ifdef EC_HAVE_CYCLES
     cycles_t cycles_start, cycles_sent, cycles_end;
@@ -870,6 +874,7 @@ void ec_master_send_datagrams(ec_master_t *master /**< EtherCAT master */)
     unsigned long jiffies_sent;
     unsigned int frame_count, more_datagrams_waiting;
     struct list_head sent_datagrams;
+    ec_fmmu_config_t* domain_fmmu;
 
 #ifdef EC_HAVE_CYCLES
     cycles_start = get_cycles();
@@ -918,7 +923,28 @@ void ec_master_send_datagrams(ec_master_t *master /**< EtherCAT master */)
             cur_data += EC_DATAGRAM_HEADER_SIZE;
 
             // EtherCAT datagram data
-            memcpy(cur_data, datagram->data, datagram->data_size);
+            frame_datagram_data = cur_data;
+            if (datagram->domain) {
+                unsigned int datagram_address = EC_READ_U32(datagram->address);
+                int i = 0;
+                uint8_t *domain_data = datagram->data;
+                list_for_each_entry(domain_fmmu, &datagram->domain->fmmu_configs, list) {
+                    if (domain_fmmu->dir == EC_DIR_OUTPUT ) {
+                        unsigned int frame_offset = domain_fmmu->logical_start_address-datagram_address;
+                        memcpy(frame_datagram_data+frame_offset, domain_data, domain_fmmu->data_size);
+                        if (unlikely(master->debug_level > 1)) {
+                            EC_DBG("sending dg 0x%02X fmmu %u fp=%u dp=%u size=%u\n",
+                                   datagram->index, i,frame_offset,domain_data-datagram->data,domain_fmmu->data_size);
+                            ec_print_data(domain_data, domain_fmmu->data_size);
+                        }
+                    }
+                    domain_data += domain_fmmu->data_size;
+                    ++i;
+                }
+            }
+            else {
+                memcpy(frame_datagram_data, datagram->data, datagram->data_size);
+            }
             cur_data += datagram->data_size;
 
             // EtherCAT datagram footer
@@ -988,8 +1014,9 @@ void ec_master_receive_datagrams(ec_master_t *master, /**< EtherCAT master */
     size_t frame_size, data_size;
     uint8_t datagram_type, datagram_index;
     unsigned int cmd_follows, matched;
-    const uint8_t *cur_data;
+    const uint8_t *cur_data, *frame_datagram_data;
     ec_datagram_t *datagram;
+    ec_fmmu_config_t* domain_fmmu;
 
     if (unlikely(size < EC_FRAME_HEADER_SIZE)) {
         if (master->debug_level) {
@@ -1072,9 +1099,29 @@ void ec_master_receive_datagrams(ec_master_t *master, /**< EtherCAT master */
             cur_data += data_size + EC_DATAGRAM_FOOTER_SIZE;
             continue;
         }
-
-        // copy received data into the datagram memory
-        memcpy(datagram->data, cur_data, data_size);
+        frame_datagram_data = cur_data;
+        if (datagram->domain) {
+            size_t datagram_address = EC_READ_U32(datagram->address);
+            int i = 0;
+            uint8_t *domain_data = datagram->data;
+            list_for_each_entry(domain_fmmu, &datagram->domain->fmmu_configs, list) {
+                if (domain_fmmu->dir == EC_DIR_INPUT ) {
+                    unsigned int frame_offset = domain_fmmu->logical_start_address-datagram_address;
+                    memcpy(domain_data, frame_datagram_data+frame_offset, domain_fmmu->data_size);
+                    if (unlikely(master->debug_level > 1)) {
+                        EC_DBG("receiving dg 0x%02X fmmu %u fp=%u dp=%u size=%u\n",
+                               datagram->index, i,frame_offset,domain_data-datagram->data,domain_fmmu->data_size);
+                        ec_print_data(domain_data, domain_fmmu->data_size);
+                    }
+                }
+                domain_data += domain_fmmu->data_size;
+                ++i;
+            }
+        }
+        else {
+            // copy received data into the datagram memory
+            memcpy(datagram->data, frame_datagram_data, data_size);
+        }
         cur_data += data_size;
 
         // set the datagram's working counter
@@ -2297,12 +2344,36 @@ void ecrt_master_state(const ec_master_t *master, ec_master_state_t *state)
 
 /*****************************************************************************/
 
+void ecrt_master_configured_slaves_state(const ec_master_t *master, ec_master_state_t *state)
+{
+    const ec_slave_config_t *sc;
+    ec_slave_config_state_t sc_state;
+
+    // collect al_states of all configured online slaves
+    state->al_states = 0;
+    list_for_each_entry(sc, &master->configs, list) {
+        ecrt_slave_config_state(sc,&sc_state);
+        if (sc_state.online)
+            state->al_states |= sc_state.al_state;
+    }
+
+    state->slaves_responding = master->fsm.slaves_responding;
+    state->link_up = master->main_device.link_state;
+}
+
+/*****************************************************************************/
+
 void ecrt_master_application_time(ec_master_t *master, uint64_t app_time)
 {
     master->app_time = app_time;
+#ifdef EC_HAVE_CYCLES
+    master->dc_cycles_app_time = get_cycles();
+#endif
+    master->dc_jiffies_app_time = jiffies;
 
     if (unlikely(!master->has_app_time)) {
-        master->app_start_time = app_time;
+		EC_MASTER_DBG(master, 1, "set application start time = %llu\n",app_time);
+		master->app_start_time = app_time;
         master->has_app_time = 1;
     }
 }

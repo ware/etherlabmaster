@@ -539,6 +539,7 @@ int ec_cdev_ioctl_domain(
     }
 
     data.data_size = domain->data_size;
+    data.tx_size = domain->tx_size;
     data.logical_base_address = domain->logical_base_address;
     data.working_counter = domain->working_counter;
     data.expected_working_counter = domain->expected_working_counter;
@@ -592,6 +593,7 @@ int ec_cdev_ioctl_domain_fmmu(
     data.sync_index = fmmu->sync_index;
     data.dir = fmmu->dir;
     data.logical_address = fmmu->logical_start_address;
+    data.domain_address = fmmu->domain_address;
     data.data_size = fmmu->data_size;
 
     up(&master->master_sem);
@@ -1887,6 +1889,29 @@ int ec_cdev_ioctl_master_state(
 
 /*****************************************************************************/
 
+/** Get the master state of all configured slaves.
+ */
+int ec_cdev_ioctl_master_sc_state(
+        ec_master_t *master, /**< EtherCAT master. */
+        unsigned long arg, /**< ioctl() argument. */
+        ec_cdev_priv_t *priv /**< Private data structure of file handle. */
+        )
+{
+    ec_master_state_t data;
+
+    if (unlikely(!priv->requested))
+        return -EPERM;
+
+    ecrt_master_configured_slaves_state(master, &data);
+
+    if (copy_to_user((void __user *) arg, &data, sizeof(data)))
+        return -EFAULT;
+
+    return 0;
+}
+
+/*****************************************************************************/
+
 /** Get the master state.
  */
 int ec_cdev_ioctl_app_time(
@@ -2077,6 +2102,50 @@ int ec_cdev_ioctl_sc_watchdog(
 
     ecrt_slave_config_watchdog(sc,
             data.watchdog_divider, data.watchdog_intervals);
+
+out_up:
+    up(&master->master_sem);
+out_return:
+    return ret;
+}
+
+
+/*****************************************************************************/
+
+/** Configure wether a slave allows overlapping PDOs.
+ */
+int ec_cdev_ioctl_sc_allow_overlapping_pdos(
+        ec_master_t *master, /**< EtherCAT master. */
+        unsigned long arg, /**< ioctl() argument. */
+        ec_cdev_priv_t *priv /**< Private data structure of file handle. */
+        )
+{
+    ec_ioctl_config_t data;
+    ec_slave_config_t *sc;
+    int ret = 0;
+
+    if (unlikely(!priv->requested)) {
+        ret = -EPERM;
+        goto out_return;
+    }
+
+    if (copy_from_user(&data, (void __user *) arg, sizeof(data))) {
+        ret = -EFAULT;
+        goto out_return;
+    }
+
+    if (down_interruptible(&master->master_sem)) {
+        ret = -EINTR;
+        goto out_return;
+    }
+
+    if (!(sc = ec_master_get_config(master, data.config_index))) {
+        ret = -ENOENT;
+        goto out_up;
+    }
+
+    ecrt_slave_config_overlapping_pdos(sc,
+            data.allow_overlapping_pdos);
 
 out_up:
     up(&master->master_sem);
@@ -3651,6 +3720,8 @@ long eccdev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
             return ec_cdev_ioctl_receive(master, arg, priv);
         case EC_IOCTL_MASTER_STATE:
             return ec_cdev_ioctl_master_state(master, arg, priv);
+        case EC_IOCTL_MASTER_SC_STATE:
+            return ec_cdev_ioctl_master_sc_state(master, arg, priv);
         case EC_IOCTL_APP_TIME:
             if (!(filp->f_mode & FMODE_WRITE))
                 return -EPERM;
@@ -3679,6 +3750,10 @@ long eccdev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
             if (!(filp->f_mode & FMODE_WRITE))
                 return -EPERM;
             return ec_cdev_ioctl_sc_watchdog(master, arg, priv);
+        case EC_IOCTL_SC_OVERLAPPING_IO:
+            if (!(filp->f_mode & FMODE_WRITE))
+                return -EPERM;
+            return ec_cdev_ioctl_sc_allow_overlapping_pdos(master,arg,priv);
         case EC_IOCTL_SC_ADD_PDO:
             if (!(filp->f_mode & FMODE_WRITE))
                 return -EPERM;

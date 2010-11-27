@@ -48,7 +48,11 @@
 
 /** Time difference [ns] to tolerate without setting a new system time offset.
  */
+#ifdef EC_HAVE_CYCLES
+#define EC_SYSTEM_TIME_TOLERANCE_NS 10000
+#else
 #define EC_SYSTEM_TIME_TOLERANCE_NS 100000000
+#endif
 
 /*****************************************************************************/
 
@@ -889,26 +893,27 @@ u64 ec_fsm_master_dc_offset32(
         ec_fsm_master_t *fsm, /**< Master state machine. */
         u64 system_time, /**< System time register. */
         u64 old_offset, /**< Time offset register. */
-        unsigned long jiffies_since_read /**< Jiffies for correction. */
+		u64 correction /**< Correction. */
         )
 {
     ec_slave_t *slave = fsm->slave;
-    u32 correction, system_time32, old_offset32, new_offset;
+	u32 correction32, system_time32, old_offset32, new_offset;
     s32 time_diff;
 
-    system_time32 = (u32) system_time;
-    old_offset32 = (u32) old_offset;
+	system_time32 = (u32) system_time;
+	// correct read system time by elapsed time between read operation
+	// and app_time set time
+	correction32 = (u32)correction;
+	system_time32 -= correction32;
+	old_offset32 = (u32) old_offset;
 
-    // correct read system time by elapsed time since read operation
-    correction = jiffies_since_read * 1000 / HZ * 1000000;
-    system_time32 += correction;
-    time_diff = (u32) slave->master->app_time - system_time32;
+    time_diff = (u32) slave->master->app_start_time - system_time32;
 
     EC_SLAVE_DBG(slave, 1, "DC system time offset calculation:"
             " system_time=%u (corrected with %u),"
-            " app_time=%llu, diff=%i\n",
-            system_time32, correction,
-            slave->master->app_time, time_diff);
+            " app_start_time=%llu, diff=%i\n",
+			system_time32, correction32,
+            slave->master->app_start_time, time_diff);
 
     if (EC_ABS(time_diff) > EC_SYSTEM_TIME_TOLERANCE_NS) {
         new_offset = time_diff + old_offset32;
@@ -929,23 +934,23 @@ u64 ec_fsm_master_dc_offset64(
         ec_fsm_master_t *fsm, /**< Master state machine. */
         u64 system_time, /**< System time register. */
         u64 old_offset, /**< Time offset register. */
-        unsigned long jiffies_since_read /**< Jiffies for correction. */
+		u64 correction /**< Correction. */
         )
 {
     ec_slave_t *slave = fsm->slave;
-    u64 new_offset, correction;
+	u64 new_offset;
     s64 time_diff;
 
-    // correct read system time by elapsed time since read operation
-    correction = (u64) (jiffies_since_read * 1000 / HZ) * 1000000;
-    system_time += correction;
-    time_diff = fsm->slave->master->app_time - system_time;
+	// correct read system time by elapsed time between read operation
+	// and app_time set time
+	system_time -= correction;
+    time_diff = fsm->slave->master->app_start_time - system_time;
 
     EC_SLAVE_DBG(slave, 1, "DC system time offset calculation:"
             " system_time=%llu (corrected with %llu),"
-            " app_time=%llu, diff=%lli\n",
+            " app_start_time=%llu, diff=%lli\n",
             system_time, correction,
-            slave->master->app_time, time_diff);
+            slave->master->app_start_time, time_diff);
 
     if (EC_ABS(time_diff) > EC_SYSTEM_TIME_TOLERANCE_NS) {
         new_offset = time_diff + old_offset;
@@ -969,8 +974,7 @@ void ec_fsm_master_state_dc_read_offset(
 {
     ec_datagram_t *datagram = fsm->datagram;
     ec_slave_t *slave = fsm->slave;
-    u64 system_time, old_offset, new_offset;
-    unsigned long jiffies_since_read;
+	u64 system_time, old_offset, new_offset, correction;
 
     if (datagram->state == EC_DATAGRAM_TIMED_OUT && fsm->retries--)
         return;
@@ -993,14 +997,25 @@ void ec_fsm_master_state_dc_read_offset(
 
     system_time = EC_READ_U64(datagram->data);     // 0x0910
     old_offset = EC_READ_U64(datagram->data + 16); // 0x0920
-    jiffies_since_read = jiffies - datagram->jiffies_sent;
+	/* correct read system time by elapsed time since read operation
+	   and the app_time set time */
+#ifdef EC_HAVE_CYCLES
+	correction =
+            (datagram->cycles_sent - slave->master->dc_cycles_app_start_time)
+			* 1000000LL;
+	do_div(correction,cpu_khz);
+#else
+	correction =
+			(u64) ((datagram->jiffies_sent-slave->master->dc_jiffies_app_time) * 1000 / HZ)
+			* 1000000;
+#endif
 
     if (slave->base_dc_range == EC_DC_32) {
         new_offset = ec_fsm_master_dc_offset32(fsm,
-                system_time, old_offset, jiffies_since_read);
+				system_time, old_offset, correction);
     } else {
         new_offset = ec_fsm_master_dc_offset64(fsm,
-                system_time, old_offset, jiffies_since_read);
+				system_time, old_offset, correction);
     }
 
     // set DC system time offset and transmission delay
